@@ -14,6 +14,7 @@ import pytz
 from openai import OpenAI
 import os
 from dotenv import load_dotenv
+import json
 
 # 環境変数の読み込み
 load_dotenv()
@@ -34,6 +35,10 @@ client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 # 自然言語処理モデルの初期化
 nlp = spacy.load("ja_core_news_sm")
+
+# タイムゾーンの設定
+JST = pytz.timezone('Asia/Tokyo')
+UTC = pytz.UTC
 
 class EventInfo(BaseModel):
     title: str
@@ -83,59 +88,69 @@ def extract_text_from_image(image):
             detail=f"画像の処理中にエラーが発生しました: {str(e)}"
         )
 
-def extract_datetime_info(text):
-    """テキストから日時情報を抽出"""
-    # 日時表現の抽出
-    date_patterns = [
-        r'\d{4}年\d{1,2}月\d{1,2}日',
-        r'\d{1,2}月\d{1,2}日',
-        r'\d{1,2}日',
-        r'\d{1,2}時',
-        r'\d{1,2}:\d{2}'
-    ]
-    
-    dates = []
-    for pattern in date_patterns:
-        matches = re.finditer(pattern, text)
-        for match in matches:
-            try:
-                date_str = match.group()
-                # 年が含まれていない場合は現在の年を追加
-                if not re.search(r'\d{4}年', date_str):
-                    current_year = datetime.now().year
-                    if '月' in date_str:
-                        date_str = f"{current_year}年{date_str}"
-                
-                date = parser.parse(date_str, fuzzy=True)
-                dates.append(date)
-            except:
+def extract_datetime_with_gpt(text, max_retries=3):
+    """GPTを使用してテキストから日時情報を抽出（最大3回まで再試行）"""
+    for attempt in range(max_retries):
+        try:
+            response = client.chat.completions.create(
+                model="gpt-4o",
+                messages=[
+                    {
+                        "role": "system",
+                        "content": """あなたは日時情報を抽出する専門家です。
+                        与えられたテキストから日時情報を抽出し、以下のJSON形式で出力してください：
+                        {
+                            "start_time": "YYYY-MM-DD HH:mm:ss",
+                            "end_time": "YYYY-MM-DD HH:mm:ss",
+                            "title": "イベントのタイトル",
+                            "description": "イベントの説明"
+                        }
+                        日時が不明な場合は、nullを設定してください。
+                        日付のみが指定されている場合は、時間は00:00:00としてください。
+                        終了時刻が不明な場合は、開始時刻から1時間後を設定してください。
+                        日時情報が見つからない場合は、必ずstart_timeとend_timeをnullに設定してください。
+                        全ての日時は日本時間（JST）として解釈してください。"""
+                    },
+                    {
+                        "role": "user",
+                        "content": text
+                    }
+                ],
+                response_format={ "type": "json_object" },
+                max_tokens=1000
+            )
+            
+            # JSON文字列をパース
+            result = json.loads(response.choices[0].message.content)
+            
+            # 文字列の日時をdatetimeオブジェクトに変換（JSTとして解釈）
+            if result["start_time"]:
+                naive_dt = datetime.strptime(result["start_time"], "%Y-%m-%d %H:%M:%S")
+                result["start_time"] = JST.localize(naive_dt)
+            if result["end_time"]:
+                naive_dt = datetime.strptime(result["end_time"], "%Y-%m-%d %H:%M:%S")
+                result["end_time"] = JST.localize(naive_dt)
+            
+            # 日時情報が正しく抽出できた場合のみ返す
+            if result["start_time"] and result["end_time"]:
+                return result
+            
+            # 日時情報が抽出できなかった場合は再試行
+            if attempt < max_retries - 1:
                 continue
+                
+        except Exception as e:
+            if attempt < max_retries - 1:
+                continue
+            raise HTTPException(
+                status_code=500,
+                detail=f"日時情報の抽出中にエラーが発生しました: {str(e)}"
+            )
     
-    # 日付が1つしかない場合は、終了時刻を開始時刻から1時間後に設定
-    if len(dates) == 1:
-        dates.append(dates[0] + timedelta(hours=1))
-    
-    return dates
-
-def extract_event_info(text, dates):
-    """テキストからイベント情報を抽出"""
-    # イベント情報の抽出
-    doc = nlp(text)
-    
-    # タイトルと説明の抽出（簡単な実装）
-    sentences = [sent.text for sent in doc.sents]
-    title = sentences[0] if sentences else "イベント"
-    description = " ".join(sentences[1:]) if len(sentences) > 1 else text
-    
-    # 日時の設定
-    start_time = dates[0] if dates else None
-    end_time = dates[1] if len(dates) > 1 else None
-    
-    return EventInfo(
-        title=title,
-        description=description,
-        start_time=start_time,
-        end_time=end_time
+    # 全ての試行が失敗した場合
+    raise HTTPException(
+        status_code=400,
+        detail="画像から日時情報を抽出できませんでした（3回試行しましたが失敗しました）"
     )
 
 @app.post("/extract-event", response_model=EventInfo)
@@ -148,21 +163,18 @@ async def extract_event(file: UploadFile = File(...)):
     # 画像からテキストを抽出
     text = extract_text_from_image(image)
     
-    # 日時情報の抽出
-    dates = extract_datetime_info(text)
+    # GPTを使用して日時情報を抽出
+    event_info = extract_datetime_with_gpt(text)
     
-    # イベント情報の構造化
-    event_info = extract_event_info(text, dates)
-    
-    return event_info
+    return EventInfo(**event_info)
 
 @app.post("/calendar/event")
 async def create_calendar_event(event: EventInfo):
     """カレンダーにイベントを追加するエンドポイント"""
     try:
-        # タイムゾーンをUTCに設定
-        start_time = event.start_time.replace(tzinfo=pytz.UTC)
-        end_time = event.end_time.replace(tzinfo=pytz.UTC)
+        # JSTからUTCに変換
+        start_time = event.start_time.astimezone(UTC)
+        end_time = event.end_time.astimezone(UTC)
         
         result = add_event(
             summary=event.title,
@@ -186,26 +198,23 @@ async def create_calendar_event_from_image(file: UploadFile = File(...)):
         # 画像からテキストを抽出
         text = extract_text_from_image(image)
         
-        # 日時情報の抽出
-        dates = extract_datetime_info(text)
+        # GPTを使用して日時情報を抽出
+        event_info = extract_datetime_with_gpt(text)
         
-        if not dates:
+        if not event_info["start_time"]:
             raise HTTPException(
                 status_code=400,
                 detail="画像から日時情報を抽出できませんでした"
             )
         
-        # イベント情報の構造化
-        event_info = extract_event_info(text, dates)
-        
-        # タイムゾーンをUTCに設定
-        start_time = event_info.start_time.replace(tzinfo=pytz.UTC)
-        end_time = event_info.end_time.replace(tzinfo=pytz.UTC)
+        # JSTからUTCに変換
+        start_time = event_info["start_time"].astimezone(UTC)
+        end_time = event_info["end_time"].astimezone(UTC)
         
         # カレンダーにイベントを追加
         result = add_event(
-            summary=event_info.title,
-            description=event_info.description,
+            summary=event_info["title"],
+            description=event_info["description"],
             start_time=start_time,
             end_time=end_time,
             location=None

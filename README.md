@@ -25,7 +25,7 @@ pip install -r requirements.txt
 python calendar_api.py
 ```
 
-### RESTful APIサーバーの使用
+### RESTful APIサーバーの使用 (未完成)
 
 1. サーバーを起動します：
 ```bash

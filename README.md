@@ -25,7 +25,7 @@ pip install -r requirements.txt
 python calendar_api.py
 ```
 
-### RESTful APIサーバーの使用 (未完成)
+### RESTful APIサーバーの使用
 
 1. サーバーを起動します：
 ```bash
@@ -49,7 +49,7 @@ curl -X POST "http://localhost:8000/calendar/event" \
    - Swagger UI: http://localhost:8000/docs
    - ReDoc: http://localhost:8000/redoc
 
-### Streamlit Webアプリケーションの使用
+### Streamlit Webアプリケーションの使用 (未完成)
 
 1. Streamlitアプリケーションを起動します：
 ```bash
